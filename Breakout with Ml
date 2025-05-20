@@ -1,0 +1,325 @@
+# region imports
+from AlgorithmImports import *
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit
+import numpy as np
+from collections import deque
+# endregion
+
+
+class AntiOverfitBreakout(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2025, 1, 1)
+        self.SetEndDate(2025, 5, 19)
+        self.SetCash(9000)
+
+        self.spy = self.AddEquity("SPY", Resolution.Hour).Symbol
+        self.spy_ema = self.EMA(self.spy, 200, Resolution.Hour)
+
+        self.risk_per_trade = 0.005
+        self.max_dd = 0.25
+        self.stop_mult = 1.5
+        self.profit_mult = 3
+        self.max_positions = 3
+
+        self.train_win = 250
+        self.test_win = 60
+        self.cv_folds = 3
+        self.cv_min_acc = 0.55
+        self.conf_thresh = 0.70
+        self.pred_margin = 0.20
+
+        self.lb_break = 20
+        self.ema_fast_p = 50
+        self.ema_slow_p = 200
+        self.atr_p = 14
+
+        self.sdata = {}
+        self.pos = {}
+        self.start_eq = None
+        self.peak_eq = 0
+        self.daily_pnl = {}
+        self.long_trades = 0
+        self.short_trades = 0
+
+        self.UniverseSettings.Resolution = Resolution.Hour
+        self.AddUniverse(self.Coarse)
+        self.SetWarmUp(timedelta(hours=300))
+
+        self.train_batch = 20
+        self.train_cycle_idx = 0
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(16, 0), self.TrainBatch)
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(TimeSpan.FromHours(1)), self.TradingLoop)
+
+        # NAV Chart
+        ch = Chart("Equity")
+        ch.AddSeries(Series("NAV", SeriesType.Line, 0))
+        self.AddChart(ch)
+
+        # Trade Stats Chart
+        stats = Chart("Trade Stats")
+        stats.AddSeries(Series("Long Trades", SeriesType.Bar, 0))
+        stats.AddSeries(Series("Short Trades", SeriesType.Bar, 1))
+        stats.AddSeries(Series("Daily PnL", SeriesType.Scatter, 2))
+        stats.AddSeries(Series("Drawdown", SeriesType.Line, 3))
+        self.AddChart(stats)
+
+        # Model Accuracy Chart
+        acc_chart = Chart("Model Accuracy")
+        acc_chart.AddSeries(Series("WF Accuracy", SeriesType.Line, 0))
+        self.AddChart(acc_chart)
+
+    def Coarse(self, coarse):
+        liquid = [c for c in coarse if c.HasFundamentalData and c.Price > 5]
+        return [c.Symbol for c in sorted(liquid, key=lambda x: x.DollarVolume, reverse=True)[:100]]
+
+    def OnSecuritiesChanged(self, changes: SecurityChanges):
+        for sec in changes.AddedSecurities:
+            s = sec.Symbol
+            if s not in self.sdata:
+                self.AddEquity(s.Value, Resolution.Hour)
+                self.sdata[s] = SymData(self, s, self.lb_break,
+                                        self.ema_fast_p, self.ema_slow_p,
+                                        self.atr_p, self.cv_folds, self.cv_min_acc)
+        for sec in changes.RemovedSecurities:
+            s = sec.Symbol
+            if s in self.pos:
+                self.Liquidate(s)
+                self.pos.pop(s, None)
+            self.sdata.pop(s, None)
+
+    def OnData(self, slice: Slice):
+        if self.IsWarmingUp:
+            return
+
+        if self.start_eq is None:
+            self.start_eq = self.Portfolio.TotalPortfolioValue
+
+        for s, sd in self.sdata.items():
+            if slice.Bars.ContainsKey(s):
+                sd.Update(slice.Bars[s])
+
+        self.Plot("Equity", "NAV", self.Portfolio.TotalPortfolioValue)
+
+    def TrainBatch(self):
+        if not self.sdata:
+            return
+
+        syms = list(self.sdata.keys())
+        start = (self.train_cycle_idx * self.train_batch) % len(syms)
+        batch = syms[start:start + self.train_batch]
+        if len(batch) < self.train_batch:
+            batch += syms[:self.train_batch - len(batch)]
+        self.train_cycle_idx += 1
+
+        for s in batch:
+            sd = self.sdata[s]
+            if not sd.Ready:
+                continue
+            wf_acc, _ = sd.WalkForwardCV(self.train_win, self.test_win)
+            sd.enabled = wf_acc is not None and wf_acc > 0.55
+            if wf_acc:
+                self.Plot("Model Accuracy", "WF Accuracy", wf_acc)
+
+    def TradingLoop(self):
+        if self.start_eq and self.Portfolio.TotalPortfolioValue < self.start_eq * (1 - self.max_dd):
+            return
+
+        for sym in list(self.pos.keys()):
+            self.ManagePosition(sym)
+
+        if len(self.pos) >= self.max_positions:
+            return
+
+        for sym, sd in self.sdata.items():
+            if sym in self.pos or not (sd.Ready and sd.enabled):
+                continue
+            if sd.ema_fast.Current.Value < sd.ema_slow.Current.Value:
+                continue
+
+            price = self.Securities[sym].Price
+            atr = sd.atr.Current.Value
+            if atr <= 0:
+                continue
+
+            direction = 1 if price > sd.HighHigh else -1 if price < sd.LowLow else 0
+            if direction == 0:
+                continue
+
+            pred, prob, ready, margin = sd.PredictWithMargin(sd.Features())
+            if not ready or margin < self.pred_margin or prob < self.conf_thresh:
+                continue
+            if (direction == 1 and pred != 1) or (direction == -1 and pred != 0):
+                continue
+
+            stop_price = price - direction * self.stop_mult * atr
+            risk_per_share = abs(price - stop_price)
+            target_risk = self.Portfolio.TotalPortfolioValue * self.risk_per_trade
+            qty = int(target_risk / risk_per_share)
+            if qty < 1:
+                continue
+
+            order = self.MarketOrder(sym, qty * direction)
+            if order.Status == OrderStatus.Filled:
+                self.pos[sym] = PositionInfo(price, qty, atr, direction)
+                if direction == 1:
+                    self.long_trades += 1
+                    self.Plot("Trade Stats", "Long Trades", self.long_trades)
+                else:
+                    self.short_trades += 1
+                    self.Plot("Trade Stats", "Short Trades", self.short_trades)
+
+    def ManagePosition(self, sym: Symbol):
+        p = self.pos[sym]
+        px = self.Securities[sym].Price
+        stop = p.entry - self.stop_mult * p.atr * p.dir
+        tgt = p.entry + self.profit_mult * p.atr * p.dir
+
+        exit_now = (p.dir == 1 and (px <= stop or px >= tgt)) or \
+                   (p.dir == -1 and (px >= stop or px <= tgt))
+
+        if exit_now:
+            self.Liquidate(sym)
+            self.pos.pop(sym, None)
+
+    def OnEndOfDay(self):
+        dt = self.Time.date()
+        curr_eq = self.Portfolio.TotalPortfolioValue
+        if self.start_eq is None:
+            self.start_eq = curr_eq
+        self.daily_pnl[dt] = curr_eq - self.start_eq
+        self.Plot("Trade Stats", "Daily PnL", self.daily_pnl[dt])
+
+        self.peak_eq = max(self.peak_eq, curr_eq)
+        drawdown = self.peak_eq - curr_eq
+        self.Plot("Trade Stats", "Drawdown", drawdown)
+
+
+# ==============================================================================
+
+class SymData:
+    def __init__(self, algo: QCAlgorithm, sym: Symbol, lb: int,
+                 ema_fast_p: int, ema_slow_p: int, atr_p: int,
+                 cv_folds: int, cv_min_acc: float):
+        self.a = algo
+        self.sym = sym
+        self.cv_folds = cv_folds
+        self.cv_min_acc = cv_min_acc
+        self.enabled = False
+
+        self.atr = AverageTrueRange(atr_p, MovingAverageType.Wilders)
+        self.ema_fast = ExponentialMovingAverage(ema_fast_p)
+        self.ema_slow = ExponentialMovingAverage(ema_slow_p)
+        self.rsi = RelativeStrengthIndex(14)
+        self.mom1 = RateOfChange(1)
+        self.mom3 = RateOfChange(3)
+        self.vf = ExponentialMovingAverage(12)
+        self.vs = ExponentialMovingAverage(26)
+        self.pvo = Identity("PVO")
+        self.highs = RollingWindow[float](lb)
+        self.lows = RollingWindow[float](lb)
+
+        self.X, self.y = deque(maxlen=4000), deque(maxlen=4000)
+        self.bull = RandomForestClassifier(n_estimators=200, max_depth=4,
+                                           min_samples_leaf=5, random_state=7, n_jobs=-1)
+        self.bear = RandomForestClassifier(n_estimators=200, max_depth=4,
+                                           min_samples_leaf=5, random_state=7, n_jobs=-1)
+        self.trained_bull = self.trained_bear = False
+
+    def Update(self, bar: TradeBar):
+        for ind in (self.atr, self.ema_fast, self.ema_slow,
+                    self.rsi, self.mom1, self.mom3):
+            ind.Update(bar)
+
+        vpt = IndicatorDataPoint(bar.EndTime, bar.Volume)
+        self.vf.Update(vpt)
+        self.vs.Update(vpt)
+        if self.vf.IsReady and self.vs.IsReady and self.vs.Current.Value:
+            pvo_val = (self.vf.Current.Value - self.vs.Current.Value) / self.vs.Current.Value
+            self.pvo.Update(IndicatorDataPoint(bar.EndTime, pvo_val))
+
+        self.highs.Add(bar.High)
+        self.lows.Add(bar.Low)
+
+        if self.Ready:
+            self.X.append(self.Features())
+            self.y.append(1 if bar.Close > bar.Open else 0)
+
+    @property
+    def Ready(self) -> bool:
+        inds = [self.atr, self.ema_fast, self.ema_slow,
+                self.rsi, self.mom1, self.mom3,
+                self.vf, self.vs, self.pvo]
+        return all(ind.IsReady for ind in inds) and self.highs.IsReady and self.lows.IsReady
+
+    @property
+    def HighHigh(self) -> float:
+        return max(self.highs)
+
+    @property
+    def LowLow(self) -> float:
+        return min(self.lows)
+
+    def Features(self):
+        ema_ratio = self.ema_fast.Current.Value / self.ema_slow.Current.Value - 1
+        return [
+            self.atr.Current.Value,
+            ema_ratio,
+            self.mom1.Current.Value,
+            self.mom3.Current.Value,
+            self.rsi.Current.Value / 100.0,
+            self.pvo.Current.Value,
+        ]
+
+    def Regime(self) -> int:
+        if not self.a.spy_ema.IsReady:
+            return 1
+        return 1 if self.a.Securities[self.a.spy].Price > self.a.spy_ema.Current.Value else 0
+
+    def WalkForwardCV(self, tr: int, te: int):
+        if len(self.X) < tr + te:
+            return None, None
+
+        X = np.array(self.X)
+        y = np.array(self.y)
+        X_tr, y_tr = X[-(tr + te):-te], y[-(tr + te):-te]
+        X_te, y_te = X[-te:], y[-te:]
+
+        model = self.bull if self.Regime() == 1 else self.bear
+        tscv = TimeSeriesSplit(n_splits=self.cv_folds)
+
+        cv_scores = []
+        for tr_idx, val_idx in tscv.split(X_tr):
+            model.fit(X_tr[tr_idx], y_tr[tr_idx])
+            cv_scores.append((model.predict(X_tr[val_idx]) == y_tr[val_idx]).mean())
+        cv_acc = float(np.mean(cv_scores))
+        if cv_acc < self.cv_min_acc:
+            return None, cv_acc
+
+        model.fit(X_tr, y_tr)
+        if self.Regime() == 1:
+            self.trained_bull = True
+        else:
+            self.trained_bear = True
+        wf_acc = float((model.predict(X_te) == y_te).mean())
+        return wf_acc, cv_acc
+
+    def PredictWithMargin(self, feat):
+        model = self.bull if self.Regime() == 1 else self.bear
+        ready = self.trained_bull if self.Regime() == 1 else self.trained_bear
+        if not ready:
+            return 1, 0.5, False, 0.0
+        proba = model.predict_proba([feat])[0]
+        margin = abs(proba[1] - proba[0])
+        return int(proba[1] >= 0.5), max(proba), True, margin
+
+
+# ==============================================================================
+
+class PositionInfo:
+    def __init__(self, entry: float, qty: int, atr: float, dir_: int):
+        self.entry = entry
+        self.qty = qty
+        self.atr = atr
+        self.dir = dir_
